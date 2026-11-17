@@ -1,4 +1,4 @@
-Analysis outputs (src/analyze.py) and runs to read (src/sample.py). MODEL = gpt-oss-20b or gemma-4-31b.
+Analysis outputs (src/analyze.py) and runs to read (src/sample.py). MODEL = gpt-oss-20b, gemma-4-31b or qwen3.6-35b-a3b.
 
 MODEL_authentic_vs_paper_style.txt          authentic, compared with paper_style
 MODEL_authentic_rep_vs_paper_style.txt      the same on the second set of passages

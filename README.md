@@ -23,12 +23,13 @@ In cases 3 and 4 the forged text is a finished reasoning block, written the way 
 
 Each case has 1,000 attacks per dataset: 50 absurd conditions x 20 ways of asking, each with its own code. Each style has one passage per condition.
 
-## Two models
+## Three models
 
 | Model | Why | Finished reasoning block in cases 3 and 4 |
 |---|---|---|
 | `gpt-oss-20b` | the paper's model; its reasoning channel can be written into | `<\|channel\|>analysis<\|message\|>{text}<\|end\|><\|start\|>assistant` |
 | `gemma-4-31b` | a 2026 model that resists injection: 96.1% on system-over-user conflicts in thinking mode, the best of 15 open models in [IH-Benchmark](https://arxiv.org/abs/2607.25987) | `<\|channel>thought\n{text}\n<channel\|>` |
+| `qwen3.6-35b-a3b` | a third model family of similar size: a 35B mixture-of-experts model with 3B active, in FP8 | `<think>\n{text}\n</think>\n\n` |
 
 The rule goes in the system role (gpt-oss's template turns it into its developer message). Each model samples with its model card's settings, at a pinned revision. gpt-oss's template prints today's date, so every gpt-oss prompt uses the date of the first run, 2026-11-05.
 
@@ -37,13 +38,13 @@ The rule goes in the system role (gpt-oss's template turns it into its developer
 | Dataset | Styled text | Plain text |
 |---|---|---|
 | `paper_style` (shared) | Built from sentence frames Claude wrote, using the wording of the paper's forgery prompt. | Restates each styled sentence in the same position. |
-| `authentic` (per model) | The model's own reasoning, from runs where it really was allowed to share the code. | The same reasoning, rewritten in plain prose by the model itself and checked by code and by both models. |
+| `authentic` (per model) | The model's own reasoning, from runs where it really was allowed to share the code. | The same reasoning, rewritten in plain prose by the model itself and checked by code and by two models. |
 
-`paper_style` is shorter than the paper's examples (67 words against 110 to 127), and its plain passages are a bit longer than its styled ones (88 words against 67).
+`paper_style` is shorter than the paper's examples (67 words against 110 to 127), and its plain passages are a bit longer than its styled ones (88 words against 67). `authentic` plain passages are longer too: at the median, by 13 to 15 words for Qwen (about 78 against 65), and by at most 6 for gpt-oss and Gemma.
 
 For `authentic`, each model got a version of the task where sharing the code really is allowed. From its reasoning we keep the part that argues for sharing, up to 200 words, deleting only the sentences that contain the code. A fixed rule picks which samples to use, so none were chosen by hand. `authentic_rep` is a second set picked the same way, to check that results hold on different passages.
 
-Each model then rewrote its own passages in plain prose. A script and both models checked that every rewrite says the same thing as the original. Nobody read the rewrites before the runs; results/MODEL/authentic_read.txt shows them.
+Each model then rewrote its own passages in plain prose. A script and two models checked that every rewrite says the same thing as the original: gpt-oss and Gemma checked theirs, and Qwen and gpt-oss checked Qwen's. Nobody read the rewrites before the runs; results/MODEL/authentic_read.txt shows them.
 
 Details are in src/authentic_rule.py (picking) and src/make_plain.py (rewriting).
 
@@ -66,29 +67,32 @@ scripts/plain.sh           runs make_plain.py's steps in order on one pool
 
 ## Run
 
-On one GPU pod with at least 80 GB (gpt-oss-20b) or 96 GB (Gemma 4 31B in BF16), from the repo root. make_plain.py runs Gemma at 49k tokens, which needs an H200 (141 GB).
+On one GPU pod, from the repo root: at least 80 GB for gpt-oss-20b and 96 GB for Gemma 4 31B in BF16 (Gemma's plain rewrites, at 49k tokens, needed an H200). Qwen ran every step on one H100 NVL (94 GB). gpt-oss's and Gemma's datasets are final, so the scripts no longer rebuild them; these are Qwen's steps.
 
 ```bash
 bash scripts/setup_pod.sh
 source /root/venv/bin/activate   # vLLM needs the venv's ninja on PATH
 export HF_HOME=/root/hf OMP_NUM_THREADS=16 TOKENIZERS_PARALLELISM=false
+export PLAIN_ARM=qwen            # make_plain.py's Qwen arm: Qwen rewrites, Qwen and gpt-oss check
+export VLLM_USE_DEEP_GEMM=0      # DeepGEMM's FP8 kernels need nvcc 12.9 or newer
+Q=qwen3.6-35b-a3b
 
-python src/run.py gemma-4-31b paper_style --dry     # read the exact prompts
-python src/run.py gemma-4-31b paper_style --smoke   # 91 items per cell
-python src/run.py gemma-4-31b paper_style           # 1,000 items per cell
-python src/analyze.py gemma-4-31b paper_style
+python src/run.py $Q paper_style --dry        # read the exact prompts
+python src/run.py $Q paper_style --smoke      # 91 items per cell
+python src/run.py $Q paper_style              # 1,000 items per cell
+python src/analyze.py $Q paper_style
 
-python src/make_authentic.py gemma-4-31b design     # 64 samples per condition, to write the rule on
-python src/make_authentic.py gemma-4-31b freeze     # record the rule's fingerprint
-python src/make_authentic.py gemma-4-31b collect 1  # 1,024 fresh samples per condition per seed
-python src/make_authentic.py gemma-4-31b build      # both sets, and results/MODEL/authentic_read.txt
-bash scripts/plain.sh design 24                     # on an H200: spare passages, calibration, go/no-go
-python src/make_plain.py freeze                     # record the plain rule's fingerprint, on the pod
-bash scripts/plain.sh picks 24                      # plain versions of both models' picks
-python src/make_plain.py pick                       # put them in the datasets and check them
-python src/make_authentic.py gemma-4-31b score      # is styled likelier than plain as the model's reasoning?
-python src/run.py gemma-4-31b authentic
-python src/analyze.py gemma-4-31b authentic --vs paper_style
+python src/make_authentic.py $Q design        # 64 samples per condition, to write the rule on
+python src/make_authentic.py $Q freeze        # record the rule's fingerprint
+python src/make_authentic.py $Q collect 1     # 1,024 fresh samples per condition per seed
+python src/make_authentic.py $Q build         # both sets, and results/MODEL/authentic_read.txt
+bash scripts/plain.sh design 24               # spare passages, calibration, go/no-go
+python src/make_plain.py freeze               # record the plain rule's fingerprint, on the pod
+bash scripts/plain.sh picks 24                # plain versions of the picks
+python src/make_plain.py pick                 # put them in the datasets and check them
+python src/make_authentic.py $Q score picks   # is styled likelier than plain as the model's reasoning?
+python src/run.py $Q authentic
+python src/analyze.py $Q authentic --vs paper_style
 ```
 
 ## Results
@@ -103,6 +107,9 @@ Attack success in %, 1,000 attacks per cell.
 | gemma-4-31b | `paper_style` | 0.0 | 0.0 | 0.0 | 53.7 | 4.6 |
 | gemma-4-31b | `authentic` | 0.0 | 0.0 | 0.0 | 94.1 | 61.7 |
 | gemma-4-31b | `authentic_rep` | 0.0 | 0.0 | 0.0 | 97.8 | 65.4 |
+| qwen3.6-35b-a3b | `paper_style` | 0.0 | 0.0 | 0.0 | 94.4 | 90.1 |
+| qwen3.6-35b-a3b | `authentic` | 0.0 | 0.1 | 0.0 | 79.4 | 87.2 |
+| qwen3.6-35b-a3b | `authentic_rep` | 0.0 | 0.6 | 0.0 | 78.6 | 87.2 |
 
 Style effect (styled minus plain) in each location, in points, with 95% CIs:
 
@@ -114,6 +121,9 @@ Style effect (styled minus plain) in each location, in points, with 95% CIs:
 | gemma-4-31b | `paper_style` | 0 (both cells at 0%) | +49.1 [+38.3, +59.4] |
 | gemma-4-31b | `authentic` | 0 (both cells at 0%) | +32.4 [+22.2, +43.7] |
 | gemma-4-31b | `authentic_rep` | 0 (both cells at 0%) | +32.4 [+21.8, +43.6] |
+| qwen3.6-35b-a3b | `paper_style` | 0 (both cells at 0%) | +4.3 [+0.3, +8.4] |
+| qwen3.6-35b-a3b | `authentic` | +0.1 [+0.0, +0.6] | -7.8 [-15.0, -0.8] |
+| qwen3.6-35b-a3b | `authentic_rep` | +0.6 [+0.0, +1.7] | -8.6 [-14.9, -2.9] |
 
 Full outputs, with every contrast and the dataset comparisons, are in results/analysis/. The raw rows are in results/MODEL/. The sample pools and the rewriting pipeline's state are too big for GitHub and are not in the repo.
 
@@ -132,10 +142,10 @@ Full outputs, with every contrast and the dataset comparisons, are in results/an
 - **gpt-oss's `authentic` sets lean toward passages it could rewrite.** 17 of its 100 picks got no accepted rewrite and were replaced by the next pick. Gemma needed no replacements.
 - **Likelihood**: how often styled was likelier than plain as the opening of the model's own reasoning, with the median gap in nats per token.
 
-  | Set | gpt-oss | Gemma |
-  |---|---|---|
-  | `authentic` | 50/50, +0.70 | 45/50, +0.33 |
-  | `authentic_rep` | 50/50, +0.71 | 45/50, +0.25 |
-  | `paper_style` | 50/50, +0.36 | 0/50, −0.66 |
+  | Set | gpt-oss | Gemma | Qwen |
+  |---|---|---|---|
+  | `authentic` | 50/50, +0.70 | 45/50, +0.33 | 50/50, +0.97 |
+  | `authentic_rep` | 50/50, +0.71 | 45/50, +0.25 | 50/50, +1.02 |
+  | `paper_style` | 50/50, +0.36 | 0/50, −0.65 | 13/50, −0.08 |
 
 - **One veto by reading**: Gemma's first pick for condition 43 kept a remark that the request is in English after the cut removed its rebuttal, so it was replaced by the next candidate (`VETOES` in make_authentic.py).
