@@ -14,3 +14,9 @@ results/pod_logs/
 
 # Freeze records, kept locally
 data/forgeries/**/*freeze.txt
+
+# Smoke runs, run metadata and design-stage files, kept locally
+results/*/*_smoke.json
+results/*/*.env.json
+results/*/authentic_scores.json
+results/*/plain_design_*.json

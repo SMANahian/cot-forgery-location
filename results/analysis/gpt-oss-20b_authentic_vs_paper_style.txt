@@ -1,0 +1,22 @@
+none                                     +0.1  [  +0.0,   +0.6]  
+user/styled                             +56.5  [ +48.0,  +64.5]  
+user/plain                               +4.4  [  +1.7,   +7.8]  
+real/styled                             +89.9  [ +83.3,  +95.1]  
+real/plain                              +60.8  [ +51.7,  +70.1]  
+
+style in user message (1 - 2)           +52.1  [ +43.1,  +60.2]  
+style in real reasoning (3 - 4)         +29.1  [ +20.7,  +37.7]  
+location, styled (3 - 1)                +33.4  [ +25.1,  +41.7]  
+location, plain (4 - 2)                 +56.4  [ +46.8,  +65.9]  
+style x location ((3 - 4) - (1 - 2))    -23.0  [ -35.1,   -9.7]  
+
+no final answer, authentic: none=   2 user/styled=   0 user/plain=   1 real/styled=   5 real/plain=  16
+no final answer, paper_style: none=   2 user/styled=   0 user/plain=   1 real/styled=   0 real/plain=  16
+
+authentic minus paper_style:
+style effect in user                    -11.5  [ -23.1,   -0.0]  
+raw user/plain difference (diagnostic)   +0.5  [  -3.1,   +4.5]  
+style effect in real                    +27.2  [ +18.9,  +35.6]  
+raw real/plain difference (diagnostic)  -36.5  [ -45.9,  -27.4]  
+
+* a cell in this row is at 0% or 100%, so its interval leaves out that cell's uncertainty
