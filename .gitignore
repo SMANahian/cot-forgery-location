@@ -1,3 +1,11 @@
-results/
 __pycache__/
 .DS_Store
+.claude/
+
+# Too big for GitHub (up to 517 MB a file): sample pools, plain-pipeline state and pod backups
+results/*/authentic_seed*.json
+results/*/authentic_design.json
+results/*/plain_design.json
+results/*/plain_picks.json
+results/*/plain_calibration.json
+results/pod_logs/nov12/backup/
