@@ -8,4 +8,9 @@ results/*/authentic_design.json
 results/*/plain_design.json
 results/*/plain_picks.json
 results/*/plain_calibration.json
-results/pod_logs/nov12/backup/
+
+# Pipeline logs, kept locally
+results/pod_logs/
+
+# Freeze records, kept locally
+data/forgeries/**/*freeze.txt
