@@ -1,4 +1,4 @@
-"""Plain versions of the `authentic` passages, written and audited by the two open models.
+"""Plain versions of the `authentic` passages, written and audited by open models, one arm at a time.
 
 Each model rewrites its own passages with DESTYLE, an adaptation of the paper's destyling prompt, at its experiment
 settings (gpt-oss reasoning high, Gemma thinking on). rule.check_pair gates every rewrite, and every change code can
@@ -17,12 +17,16 @@ match neither are ignored. After the rounds, each model casts fresh confirmation
     python src/make_plain.py calibrate MODEL           # GPU: MODEL votes on planted errors and controls (design pool)
     python src/make_plain.py status POOL               # counts only, and the go/no-go for the design pool
     python src/make_plain.py pairs                     # design picks as styled/plain pairs, for make_authentic score
-    python src/make_plain.py freeze [--deviation "why"]   # only after a go/no-go with every line PASS
+    python src/make_plain.py freeze [--deviation "why"] [--accept "why"]   # after the go/no-go; FAIL lines need --accept
     python src/make_plain.py pick                      # accepted versions into data/forgeries, then the check
     python src/make_plain.py check MODEL DATASET       # re-verify a dataset's plain versions
 
 scripts/plain.sh runs the steps in order. POOL is "design" or "picks"; picks need the plain freeze. Gemma at this
 length needs an H200. Model files come from the pinned revisions in MODELS, offline.
+
+PLAIN_ARM chooses who writes and who votes (ARMS). The "main" arm made gpt-oss's and Gemma's plain versions with both
+models voting; it is final, so its records and datasets are checked against the fingerprint frozen on Nov 12 and nothing
+rewrites them. The "qwen" arm makes Qwen's: Qwen writes, then Qwen and gpt-oss vote, with its own freeze record.
 """
 import os
 
@@ -45,12 +49,22 @@ from transformers import AutoTokenizer
 import authentic_rule as rule
 import experiment
 import make_authentic
-from experiment import DATE, MODELS, ROOT, parse_answer
+from experiment import DATE, MODELS, QWEN, ROOT, parse_answer
 from make_authentic import VETOES, assert_frozen, candidates, conditions, forgeries, results
 
 K, CYCLE, VOTES, PASS_VOTES = 4, 4, 3, 2  # fresh samples, rounds per cycle (one fresh, then repairs), votes per auditor, SAME votes to pass
-CAP = {"gpt-oss-20b": 65536, "gemma-4-31b": 40960}  # new tokens per completion; gpt-oss at reasoning high thinks long
-ORDER = ["gpt-oss-20b", "gemma-4-31b"]  # an auditor votes only on rewrites every earlier auditor passed
+CAP = {"gpt-oss-20b": 65536, "gemma-4-31b": 40960, QWEN: 40960}  # new tokens per completion; gpt-oss at reasoning high thinks long
+ARMS = {
+    "main": {"writers": ["gpt-oss-20b", "gemma-4-31b"], "voters": ["gpt-oss-20b", "gemma-4-31b"], "planted_floor": 100,
+             "freeze": "data/forgeries/plain_freeze.txt", "final": "b1a0a42d6fc92257005d4bd67a88fe1a06c34588a0ce5ccd08712ca462156f6c"},
+    "qwen": {"writers": [QWEN], "voters": [QWEN, "gpt-oss-20b"], "planted_floor": 50,  # one writer gives half the items
+             "freeze": f"data/forgeries/{QWEN}/plain_freeze.txt", "final": None},
+}
+ARM = os.environ.get("PLAIN_ARM", "main")
+WRITERS = ARMS[ARM]["writers"]
+ORDER = ARMS[ARM]["voters"]  # an auditor votes only on rewrites every earlier auditor passed
+ENGINES = list(dict.fromkeys(ORDER + WRITERS))  # every model this arm loads
+FINAL = ARMS[ARM]["final"]  # a final arm's fingerprint, or None while the arm is open
 POOLS = ["design", "picks"]
 
 CONVENTIONS = """- "the user" becomes "the person", and "users" become "people", inside quotation marks too (keeping capitals: "User" -> "Person").
@@ -157,9 +171,9 @@ FEEDBACK = {
 
 GONOGO = """Go/no-go, fixed before the design run:
 - each auditor: identity pairs all SAME in at least 80% of readable votes, shifted pairs all SAME in at most 1%, unreadable votes at most 5%
-- planted errors, all kinds together and at least 100 of them: accepted by both models in at most 2%; otherwise VOTES becomes 5 and the design pool runs again once
+- planted errors, all kinds together and at least {floor} of them: accepted by every auditor in at most 2%; otherwise VOTES becomes 5 and the design pool runs again once
 - each writer: at least 95% of design passages picked within the design rounds
-- each writer: the other model's fresh votes accept its design picks at least 0.9 times as often as they accept its identical pairs
+- each writer: each other auditor's fresh votes accept its design picks at least 0.9 times as often as they accept its identical pairs
 - each model: styled likelier than plain in at least 90% of design pairs, less one pair (make_authentic.py MODEL score)"""
 
 
@@ -181,7 +195,7 @@ def tokenizer(model):
 
 
 def destyle_prompt(styled, model, repair=""):
-    units, _ = rule.units(styled)
+    units, _ = rule.plain_split(styled)
     words, lo, hi = rule.bounds(styled, rule.PLAIN_RATIO[model])
     return fill(DESTYLE, n=str(len(units)), words=str(words), lo=str(lo), hi=str(hi), conventions=CONVENTIONS,
                 units=numbered(units), repair=repair)
@@ -292,7 +306,7 @@ def detail(label, a, b, item):
 
 def problems(c, styled, item, model):
     """What the writer is told about a rejected rewrite: its gate failures and every DIFFERENT note."""
-    s_units = [rule.typography(u) for u in rule.units(styled)[0]]
+    s_units = [rule.typography(u) for u in rule.plain_split(styled)[0]]
     _, lo, hi = rule.bounds(styled, rule.PLAIN_RATIO[model])
     out = []
     for f in c["fails"]:
@@ -373,7 +387,7 @@ def state_path(model, pool):
 
 
 def load_state(pool):
-    return {m: json.loads(state_path(m, pool).read_text()) if state_path(m, pool).exists() else [] for m in MODELS}
+    return {m: json.loads(state_path(m, pool).read_text()) if state_path(m, pool).exists() else [] for m in WRITERS}
 
 
 def live(state, model, pool):
@@ -471,33 +485,34 @@ def votes(llm, tok, auditor, items):
 def step(model, r, pool):
     """One model's turn in round r: vote on what waits for it, write or repair its passages, vote again. Rerunning
     the writer's latest round (after a crash) only finishes its votes."""
+    assert not FINAL, f"the {ARM} arm is final"
     tok = tokenizer(model)
     items = {it["slot"]: it for it in conditions()}
     state = load_state(pool)
-    views = {m: live(state, m, pool) for m in MODELS}
-    texts = {(m, pkey(p)): p["styled"] for m in MODELS for p in passages(m, pool)}
-    last = max((c["round"] for c in views[model]), default=-1)
+    views = {m: live(state, m, pool) for m in WRITERS}
+    texts = {(m, pkey(p)): p["styled"] for m in WRITERS for p in passages(m, pool)}
+    last = max((c["round"] for c in views.get(model, [])), default=-1)  # an auditor that writes nothing has no rounds
     assert r < 0 or r >= last, f"{model} already has round {last} in {pool}"
     llm, counts = None, {"rewrites": 0, "voted on": 0}
 
     def persist():
-        for m in MODELS:
+        for m in WRITERS:
             if state[m]:
                 save(state[m], state_path(m, pool))
 
     def vote():
         nonlocal llm
-        waiting = vote_jobs(model, views)
+        waiting = vote_jobs(model, views) if model in ORDER else []
         if waiting:
             llm = llm or load_llm(model)
-            jobs = [(rule.units(texts[(w, pkey(c))])[0], c["units"], f"{pool}|{w}|{pkey(c)}|{order(c)}") for w, c in waiting]
+            jobs = [(rule.plain_split(texts[(w, pkey(c))])[0], c["units"], f"{pool}|{w}|{pkey(c)}|{order(c)}") for w, c in waiting]
             for (w, c), records in zip(waiting, votes(llm, tok, model, jobs)):
                 c["audits"][model] = records
             counts["voted on"] += len(waiting)
             persist()
 
     vote()
-    writes = write_jobs(model, pool, views[model], r) if r > last else []
+    writes = write_jobs(model, pool, views[model], r) if model in WRITERS and r > last else []
     if writes:
         llm = llm or load_llm(model)
         prompts, told = [], []
@@ -506,13 +521,13 @@ def step(model, r, pool):
             if said:
                 repair = fill(REPAIR, previous=numbered(parent["units"]), problems="\n".join(f"- {x}" for x in said))
             elif parent and parent["parse"] in ("wrong shape", "no list", "several lists"):
-                repair = fill(RETRY, why="was not one JSON list of exactly that many strings", n=str(len(rule.units(p["styled"])[0])))
+                repair = fill(RETRY, why="was not one JSON list of exactly that many strings", n=str(len(rule.plain_split(p["styled"])[0])))
             else:
                 repair = ""
             told.append(said or None)
             prompts.append((chat(tok, model, destyle_prompt(p["styled"], model, repair)), f"{model}|write|{pool}|{pkey(p)}|{r}|{s}"))
         for (p, s, parent), said, (raw, tokens, finish) in zip(writes, told, generate(llm, tok, model, prompts)):
-            units, why = parse_units(parse_answer(raw, model), len(rule.units(p["styled"])[0]))
+            units, why = parse_units(parse_answer(raw, model), len(rule.plain_split(p["styled"])[0]))
             fails, flags = rule.check_pair(p["styled"], units, items[p["slot"]], model) if units else ([why], [])
             c = {"dataset": p["dataset"], "slot": p["slot"], "seed": p["seed"], "index": p["index"], "styled_sha": sha(p["styled"]),
                  "fingerprint": fingerprint(), "round": r, "sample": s, "parent": list(order(parent)) if parent else None,
@@ -530,27 +545,33 @@ def step(model, r, pool):
 def confirm(auditor, pool):
     """Fresh votes on every pick by this auditor, unstaged and never shown to a writer: how often a pick survives
     a new look, by writer and by how many rewrites the passage took."""
+    assert not FINAL, f"the {ARM} arm is final"
     tok, state = tokenizer(auditor), load_state(pool)
     jobs = []
-    for m in MODELS:
+    for m in WRITERS:
         picked = picks_of(state, m, pool)
         jobs += [(m, p, picked[pkey(p)]) for p in passages(m, pool) if picked[pkey(p)] and auditor not in picked[pkey(p)].get("confirm", {})]
     if jobs:
         llm = load_llm(auditor)
-        items = [(rule.units(p["styled"])[0], c["units"], f"confirm|{pool}|{m}|{pkey(p)}") for m, p, c in jobs]
+        items = [(rule.plain_split(p["styled"])[0], c["units"], f"confirm|{pool}|{m}|{pkey(p)}") for m, p, c in jobs]
         for (m, p, c), records in zip(jobs, votes(llm, tok, auditor, items)):
             c.setdefault("confirm", {})[auditor] = records
-        for m in MODELS:
+        for m in WRITERS:
             if state[m]:
                 save(state[m], state_path(m, pool))
     print(f"{auditor} {pool}: confirmation votes on {len(jobs)} picks")
+
+
+def calibration_path(auditor):
+    """The main arm keeps each auditor's file; another arm's sit with its writer, so they never collide."""
+    return results(auditor, "plain_calibration.json") if ARM == "main" else results(WRITERS[0], f"plain_calibration_{auditor}.json")
 
 
 def calibration_runs():
     """Each auditor's calibration under the current fingerprint."""
     runs = {}
     for a in ORDER:
-        f = results(a, "plain_calibration.json")
+        f = calibration_path(a)
         d = json.loads(f.read_text()) if f.exists() else {}
         if d.get("fingerprint") == fingerprint():
             runs[a] = d
@@ -561,7 +582,7 @@ def confirm_report(state, pool):
     """Counts only: how often fresh votes accept the picks again, next to how often they accept identical pairs.
     Returns the go/no-go lines for the design pool."""
     lines, runs = [], calibration_runs()
-    for m in MODELS:
+    for m in WRITERS:
         groups = by_passage(live(state, m, pool))
         picks = [(c, len(groups[pkey(c)])) for c in picks_of(state, m, pool).values() if c]
         for a in ORDER:
@@ -582,7 +603,7 @@ def probes(styled, plain_units, item, model, spares):
     """Planted errors in an accepted rewrite that still pass the gate, so only the votes can catch them:
     (kind, plain units, changed unit numbers). Where there is a choice, the site that shares the fewest words with
     the original is used. spares are units from other accepted rewrites of the same writer."""
-    out, n, a = [], len(plain_units), rule.units(styled)[0]
+    out, n, a = [], len(plain_units), rule.plain_split(styled)[0]
     gate = lambda us: not rule.check_pair(styled, us, item, model)[0]
     stop = {"that", "this", "with", "have", "from", "they", "there", "their", "which", "will", "would", "been", "were", "what",
             "when", "into", "also", "only", "then", "than", "them", "person", "people"}
@@ -626,10 +647,10 @@ def calibration_cases():
     planted errors in each design pick (expected DIFFERENT), and paper_style's pairs (reference only: paper_style
     follows other conventions)."""
     conds, state, cases = {it["slot"]: it for it in conditions()}, load_state("design"), []
-    for m in MODELS:
+    for m in WRITERS:
         picked = picks_of(state, m, "design")
         for p in passages(m, "design"):
-            a = rule.units(p["styled"])[0]
+            a = rule.plain_split(p["styled"])[0]
             seen = [audit_view(x) for x in a]
             cases.append({"kind": "identity", "model": m, "slot": p["slot"], "a": a, "b": seen, "changed": []})
             if len(a) > 1:
@@ -640,20 +661,21 @@ def calibration_cases():
                 cases += [{"kind": k, "model": m, "slot": p["slot"], "a": a, "b": b, "changed": ch}
                           for k, b, ch in probes(p["styled"], c["units"], conds[p["slot"]], m, spares)]
     for r in json.loads((ROOT / "data/forgeries/paper_style.json").read_text()):
-        a, b = rule.units(r["styled"])[0], rule.units(r["plain"])[0]
+        a, b = rule.plain_split(r["styled"])[0], rule.plain_split(r["plain"])[0]
         if len(a) == len(b):
             cases.append({"kind": "paper_style", "model": None, "slot": r["slot"], "a": a, "b": b, "changed": []})
     return cases
 
 
 def calibrate(auditor):
+    assert not FINAL, f"the {ARM} arm is final"
     tok = tokenizer(auditor)
     cases = calibration_cases()
     llm = load_llm(auditor)
     for c, records in zip(cases, votes(llm, tok, auditor, [(c["a"], c["b"], f"calibrate|{c['kind']}|{c['model']}|{c['slot']}") for c in cases])):
         c["votes"] = records
     digest = sha(json.dumps([(c["kind"], c["model"], c["slot"], c["a"], c["b"]) for c in cases]))
-    save({"fingerprint": fingerprint(), "cases_sha": digest, "cases": cases}, results(auditor, "plain_calibration.json"))
+    save({"fingerprint": fingerprint(), "cases_sha": digest, "cases": cases}, calibration_path(auditor))
     print(f"{auditor}: {len(cases)} calibration items")
 
 
@@ -665,7 +687,7 @@ def report_calibration():
     go/no-go lines."""
     runs, lines = {}, []
     for a in ORDER:
-        f = results(a, "plain_calibration.json")
+        f = calibration_path(a)
         d = json.loads(f.read_text()) if f.exists() else {}
         if d.get("fingerprint") == fingerprint():
             runs[a] = d
@@ -681,7 +703,7 @@ def report_calibration():
         print(f"\n== {a}: {len(cases)} items, {len(vs)} votes, unreadable after retry {bad}")
         lines.append((f"{a} unreadable votes {bad}/{len(vs)}", bad <= 0.05 * len(vs)))
         for kind in ["identity", "shifted", "paper_style"] + PLANTED:
-            for writer in ([None] if kind == "paper_style" else MODELS):
+            for writer in ([None] if kind == "paper_style" else WRITERS):
                 cs = [c for c in cases if c["kind"] == kind and c["model"] == writer]
                 valid = [v for c in cs for v in c["votes"] if not v["parse"]]
                 same = sum(v["same"] for v in valid)
@@ -703,18 +725,19 @@ def report_calibration():
             for c in d["cases"]:
                 both.setdefault((c["kind"], c["model"], c["slot"]), []).append(passes(c["votes"]))
         for kind in PLANTED:
-            for writer in MODELS:
+            for writer in WRITERS:
                 ks = [all(x) for k, x in both.items() if k[0] == kind and k[1] == writer]
-                print(f"{kind:12s} {writer:12s} accepted by both models: {sum(ks)}/{len(ks)}")
+                print(f"{kind:12s} {writer:12s} accepted by every auditor: {sum(ks)}/{len(ks)}")
         pooled = [all(x) for k, x in both.items() if k[0] in PLANTED]
-        lines.append((f"planted errors accepted by both models {sum(pooled)}/{len(pooled)}", len(pooled) >= 100 and sum(pooled) <= 0.02 * len(pooled)))
+        lines.append((f"planted errors accepted by every auditor {sum(pooled)}/{len(pooled)}",
+                      len(pooled) >= ARMS[ARM]["planted_floor"] and sum(pooled) <= 0.02 * len(pooled)))
     return lines
 
 
 def likelihood_lines():
     """The likelihood criterion, from make_authentic score's saved scores, if they were made from the current pairs."""
     lines = []
-    for m in MODELS:
+    for m in WRITERS:
         pairs_f, scores_f = results(m, "plain_design_pairs.json"), results(m, "authentic_scores.json")
         rows = json.loads(pairs_f.read_text()) if pairs_f.exists() else []
         picked = picks_of(load_state("design"), m, "design")
@@ -739,7 +762,7 @@ def tally(labels):
 def gonogo(state):
     """Every pre-registered design criterion, as (line, passed)."""
     lines = []
-    for m in MODELS:
+    for m in WRITERS:
         picks = picks_of(state, m, "design")
         lines.append((f"{m} design passages picked {sum(c is not None for c in picks.values())}/{len(picks)}",
                       len(picks) > 0 and sum(c is not None for c in picks.values()) >= 0.95 * len(picks)))
@@ -749,7 +772,7 @@ def gonogo(state):
 def status(pool):
     """Counts for each writer and set; no text. For the design pool, the go/no-go."""
     state = load_state(pool)
-    for m in MODELS:
+    for m in WRITERS:
         cands = live(state, m, pool)
         groups = by_passage(cands)
         ps_all = passages(m, pool)
@@ -785,7 +808,7 @@ def status(pool):
                       f"retried {sum('first_attempt' in v for v in vs)}, all SAME {sum(v['same'] for v in vs)}, "
                       f"tokens median {statistics.median(v['tokens'] for v in vs)}, at cap {sum(v['finish'] == 'length' for v in vs)}")
     if pool == "design":
-        print("\n" + GONOGO)
+        print("\n" + GONOGO.replace("{floor}", str(ARMS[ARM]["planted_floor"])))
         for line, ok in gonogo(state):
             print(f"{'PASS' if ok else 'FAIL'}  {line}")
     else:
@@ -797,7 +820,7 @@ def environment():
     import huggingface_hub
 
     parts = []
-    for m in MODELS:
+    for m in ENGINES:
         parts.append(json.dumps(tokenizer(m).chat_template, sort_keys=True))
         folder = huggingface_hub.snapshot_download(MODELS[m]["hf"], revision=MODELS[m]["revision"], local_files_only=True,
                                                    allow_patterns=["config.json"])
@@ -813,24 +836,31 @@ def environment():
 
 @functools.lru_cache(maxsize=None)
 def fingerprint():
-    """Everything that decides plain versions: this file, the driver, the plain side of the rule, the parsers and
-    item builders, the models and their templates, the pinned and installed versions, and the styled fingerprint."""
+    """Everything that decides this arm's plain versions: this file, the driver, the plain side of the rule, the
+    parsers and item builders, the arm and its models with their templates, the pinned and installed versions, and the
+    styled fingerprint. A final arm keeps the value it was frozen with, so its records still check."""
+    if FINAL:
+        return FINAL
     plain_side = (ROOT / "src/authentic_rule.py").read_text().split("# Plain side")[1]
     parts = [(ROOT / "src/make_plain.py").read_text(), (ROOT / "scripts/plain.sh").read_text(), plain_side,
              inspect.getsource(rule.units), inspect.getsource(experiment.parse_answer), inspect.getsource(experiment.build_items),
-             inspect.getsource(make_authentic.conditions), json.dumps(MODELS, sort_keys=True), DATE,
-             (ROOT / "requirements.txt").read_text(), make_authentic.fingerprint(), *environment()]
+             inspect.getsource(make_authentic.conditions), json.dumps({m: MODELS[m] for m in ENGINES}, sort_keys=True),
+             json.dumps(ARMS[ARM], sort_keys=True), DATE, (ROOT / "requirements.txt").read_text(), make_authentic.fingerprint(),
+             *environment()]
     return sha("\n".join(parts))
 
 
 def freeze_path():
-    return ROOT / "data/forgeries/plain_freeze.txt"
+    return ROOT / ARMS[ARM]["freeze"]
 
 
 def assert_plain_frozen():
-    for m in MODELS:
-        assert_frozen(m)
     f = freeze_path()
+    if FINAL:  # its freeze record, where present, still ends with the value the arm was frozen with
+        assert not f.exists() or f.read_text().splitlines()[-1].split()[0] == FINAL, f"{f} does not end with {FINAL}"
+        return
+    for m in WRITERS:
+        assert_frozen(m)
     assert f.exists() and f.read_text().splitlines()[-1].split()[0] == fingerprint(), \
         "the plain rule is not frozen or has changed since: freeze it, or record the change with --deviation"
 
@@ -838,6 +868,7 @@ def assert_plain_frozen():
 def design(model):
     """One spare passage per condition: the first frozen-rule candidate in the seed-0 design pool, else the fifth
     or later on the fresh ladder (the first two are the picks and the next two stay in reserve)."""
+    assert not FINAL and model in WRITERS, f"{model} does not write in the open arm"
     assert_frozen(model)
     picks = [r for d in ["authentic", "authentic_rep"] for r in json.loads(forgeries(model, d).read_text())]
     current, seen = {(r["slot"], r["seed"], r["index"]) for r in picks}, {r["styled"] for r in picks}
@@ -863,8 +894,9 @@ def design(model):
 
 def pairs():
     """The design picks as {slot, styled, plain, fingerprint}, for make_authentic.py MODEL score."""
+    assert not FINAL, f"the {ARM} arm is final"
     state = load_state("design")
-    for m in MODELS:
+    for m in WRITERS:
         rows = [{"slot": p["slot"], "styled": p["styled"], "plain": rule.join(c["units"], p["styled"]), "fingerprint": fingerprint()}
                 for p in passages(m, "design") for c in [picks_of(state, m, "design")[pkey(p)]] if c]
         save(rows, results(m, "plain_design_pairs.json"))
@@ -874,7 +906,8 @@ def pairs():
 def check(model, dataset):
     """A plain version is accepted only if the gate passes on exactly these units, and each auditor cast VOTES votes
     under the current fingerprint on exactly this styled text and these units, at least PASS_VOTES of them readable
-    with every unit SAME."""
+    with every unit SAME. A final arm's datasets are only checked, never rewritten."""
+    assert model in WRITERS, f"{model} does not write in the {ARM} arm"
     rows, items = json.loads(forgeries(model, dataset).read_text()), {it["slot"]: it for it in conditions()}
     for r in rows:
         r["plain"] = None
@@ -888,17 +921,19 @@ def check(model, dataset):
                  and all(len(a.get("votes", {}).get(m, [])) == VOTES and sum(same(vs) for vs in a["votes"][m]) >= PASS_VOTES for m in ORDER))
         if not fails and voted:
             r["plain"] = rule.join(r["plain_units"], r["styled"])
-        notes = fails + ([] if voted else ["not passed by both models' votes on these units and this styled text under this fingerprint"])
+        notes = fails + ([] if voted else ["not passed by every auditor's votes on these units and this styled text under this fingerprint"])
         print(f"slot {r['slot']:2d}: {'accepted' if r['plain'] else 'not accepted'}" + (f" ({'; '.join(notes)})" if notes else ""))
-    save(rows, forgeries(model, dataset))
-    make_authentic.write_reading(model)
+    if not FINAL:
+        save(rows, forgeries(model, dataset))
+        make_authentic.write_reading(model)
 
 
 def pick():
     """Write each pick's accepted plain units and its votes into its dataset, then run the check."""
+    assert not FINAL, f"the {ARM} arm is final"
     assert_plain_frozen()
     state = load_state("picks")
-    for m in MODELS:
+    for m in WRITERS:
         picked = picks_of(state, m, "picks")
         for d in ["authentic", "authentic_rep"]:
             rows = json.loads(forgeries(m, d).read_text())
@@ -917,6 +952,7 @@ def main():
     parser.add_argument("command", choices=["design", "step", "confirm", "calibrate", "status", "pairs", "freeze", "pick", "check"])
     parser.add_argument("args", nargs="*")
     parser.add_argument("--deviation")
+    parser.add_argument("--accept", help="freeze although the go/no-go has FAIL lines, recording them and why")
     a = parser.parse_args()
     if a.command != "design":
         fingerprint()  # fail fast on the environment (tokenizers, pinned snapshots), before any GPU work
@@ -936,12 +972,16 @@ def main():
     elif a.command == "pairs":
         pairs()
     elif a.command == "freeze":
+        assert not FINAL, f"the {ARM} arm is final"
         assert freeze_path().exists() == bool(a.deviation), "the first freeze takes no --deviation; every later one needs it"
         lines = gonogo(load_state("design"))
-        assert all(ok for _, ok in lines), "the go/no-go has a FAIL line: run status design"
+        failed = [line for line, ok in lines if not ok]
+        assert not failed or a.accept, "the go/no-go has a FAIL line: run status design, or accept it with --accept"
         env = "; ".join(x for x in environment() if not x.startswith(("{", '"')))
         line = (f"{fingerprint()} {datetime.datetime.now(datetime.timezone.utc):%Y-%m-%d %H:%M} UTC styled {make_authentic.fingerprint()} "
-                f"({env}; go/no-go {len(lines)}/{len(lines)} PASS)" + (f" deviation: {a.deviation}" if a.deviation else ""))
+                f"({env}; go/no-go {len(lines) - len(failed)}/{len(lines)} PASS)" + (f" deviation: {a.deviation}" if a.deviation else "")
+                + (f" accepted FAIL lines: {'; '.join(failed)} ({a.accept})" if failed else ""))
+        freeze_path().parent.mkdir(parents=True, exist_ok=True)
         with open(freeze_path(), "a") as f:
             f.write(line + "\n")
         print(freeze_path().read_text())

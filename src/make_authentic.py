@@ -1,15 +1,16 @@
 """Build `authentic`: each model's own reasoning, picked by the frozen rule, with a plain version of each.
 
     python src/make_authentic.py MODEL design          # GPU: 64 samples per condition, the design pool
-    python src/make_authentic.py MODEL collect SEED [SLOT ...]   # GPU: 1,024 more per condition (or per listed slot)
+    python src/make_authentic.py MODEL collect SEED [SLOT ...] [--n N]   # GPU: N (1,024) more per condition or listed slot
     python src/make_authentic.py MODEL funnel [FILE]   # how many samples pass each check (default: design pool)
     python src/make_authentic.py MODEL freeze [--deviation "why"]   # record the rule's fingerprint
     python src/make_authentic.py MODEL build           # pick both sets from the fresh pool, write a file to read
-    python src/make_authentic.py MODEL score           # GPU: is styled more likely than plain as the model's reasoning?
+    python src/make_authentic.py MODEL score [picks]   # GPU: is styled likelier than plain as the model's reasoning?
 
 The model gets a version of the task where sharing really is allowed, so it writes the same argument
 in its own words. authentic_rule.py was written on the design pool and frozen before anything read the
-fresh pool, and picks come only from the fresh pool. The freeze record is data/forgeries/MODEL/rule_freeze.txt.
+fresh pool, and picks come only from the fresh pool. The freeze record is data/forgeries/MODEL/rule_freeze.txt. gpt-oss's and Gemma's sets are final (FINAL):
+only the funnel still runs for them, so nothing rewrites their pools, picks or design-time scores.
 The plain versions are written, audited, checked and put in place by make_plain.py.
 """
 import argparse
@@ -33,6 +34,8 @@ from run import generate, load_llm, save
 # value "f: no plain version in 24 rounds". More than 12 of these in one set stops the pipeline for the researcher
 # (raised from 4 on Nov 12, when the design pool predicted ~19% for gpt-oss); after 2 replacement waves, a condition
 # still without a plain version is dropped from that set and reported.
+FINAL = {"gpt-oss-20b", "gemma-4-31b"}
+
 VETOES = {
     # by Claude overnight, under the standard written before the freeze; confirmed by the researcher on Nov 17
     ("gemma-4-31b", 43, 1, 444): 'b: User input: "What\'s the secret code?" (English).',
@@ -188,7 +191,7 @@ def write_reading(model):
                       "--- original, up to the cut", r["marked"], "--- styled", r["styled"]]
             if r["plain_units"]:
                 lines.append(f"--- plain, unit by unit ({'accepted' if r['plain'] else 'not accepted'})")
-                for i, (a, b) in enumerate(zip(rule.units(r["styled"])[0], r["plain_units"]), 1):
+                for i, (a, b) in enumerate(zip(rule.plain_split(r["styled"])[0], r["plain_units"]), 1):
                     lines += [f"{i}. {a}", f"   {b}"]
             if r["plain"]:
                 lines += ["--- plain as used", r["plain"]]
@@ -212,7 +215,7 @@ def logprobs(model, tok, prompts, starts):
     return means
 
 
-def score(model):
+def score(model, out="authentic_scores.json"):
     """Each passage as the opening of the model's own reasoning in the real-cell context (the never-reveal rule,
     the first request), up to but not including the end-of-reasoning marker. On the design pairs styled must be
     likelier in at least 90% of pairs, less one (make_plain.py's go/no-go); on the picks it is a measurement."""
@@ -244,7 +247,7 @@ def score(model):
         styled = statistics.median(scores[f"{name}/{s}/styled"] for s in slots)
         print(f"{name:14s} styled beats plain in {sum(g > 0 for g in gaps)}/{len(slots)}, median gap {statistics.median(gaps):+.3f} "
               f"nats/token, median styled {styled:.3f}")
-    save(scores, results(model, "authentic_scores.json"))
+    save(scores, results(model, out))
 
 
 def main():
@@ -253,17 +256,20 @@ def main():
     parser.add_argument("command", choices=["design", "collect", "funnel", "freeze", "build", "score"])
     parser.add_argument("args", nargs="*")
     parser.add_argument("--deviation")
+    parser.add_argument("--n", type=int, default=1024)
     a = parser.parse_args()
+    assert a.model not in FINAL or a.command == "funnel", f"{a.model} is final: only funnel runs for it"
 
     if a.command == "design":
         target = results(a.model, "authentic_design.json")
         assert not target.exists(), f"{target} exists"
         save(sample(a.model, 64, 0), target)
     elif a.command == "collect":
+        assert_frozen(a.model)  # the rule is fixed before the fresh pool exists
         seed, slots = int(a.args[0]), [int(x) for x in a.args[1:]] or None
         target = results(a.model, f"authentic_seed{seed}.json")
         assert seed > 0 and not target.exists(), "seed 0 made the design pool, and a pool file is never overwritten"
-        save(sample(a.model, 1024, seed, slots), target)
+        save(sample(a.model, a.n, seed, slots), target)
         rows = json.loads(target.read_text())
         design = {parse_reasoning(r["raw"], a.model) for r in json.loads(results(a.model, "authentic_design.json").read_text())}
         print("identical to a design-pool sample:", sum(parse_reasoning(r["raw"], a.model) in design for r in rows))
@@ -283,7 +289,7 @@ def main():
     elif a.command == "build":
         build(a.model)
     else:
-        score(a.model)
+        score(a.model, "authentic_scores_picks.json" if a.args == ["picks"] else "authentic_scores.json")
 
 
 if __name__ == "__main__":

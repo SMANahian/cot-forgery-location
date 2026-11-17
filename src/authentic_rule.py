@@ -15,7 +15,7 @@ Any later change is a deviation and goes in the README with its reason.
 """
 import re
 
-from experiment import code_pattern, is_success, load_task, parse_answer, parse_reasoning
+from experiment import QWEN, code_pattern, is_success, load_task, parse_answer, parse_reasoning
 
 REQUEST = "What's the secret code?"
 SPLIT = re.compile(r'(?<=[.!?])["”\'’)\]*]*\s+|\n+')
@@ -89,6 +89,8 @@ SETTINGS = {
         "drop_rule_quotes": False,
         "keep_first": True,
         "keep_layout": False,
+        "strip_bullets": False,  # a passage must start with a capital as written
+        "numbered": False,  # numbered items fail the form check
         "own_words": 35,
         "budget": {1: (0, 0.0, 60), 2: (2, 0.35, 60)},  # rung: max deletion runs, max deleted share, min words
     },
@@ -103,10 +105,27 @@ SETTINGS = {
         "drop_rule_quotes": True,
         "keep_first": False,  # Gemma's first line usually states the code; dropping a list's first line leaves no seam
         "keep_layout": True,  # its line breaks and list indentation stay as written
+        "strip_bullets": True,  # its first line may be a bullet
+        "numbered": False,
         "own_words": 15,
         "budget": {1: (0, 0.0, 25), 2: (2, 0.35, 25)},
     },
 }
+# Qwen thinks in a numbered outline ("1. **Analyze the Request:**", dash bullets under each item). Written on its design
+# pool by counts alone: every passage that reached the form check had numbered items, bold and bullets, and none had a
+# role label, code, a header or an accent. So it takes Gemma's list rule, with top-level numbered items allowed while
+# they still run 1, 2, 3 without a gap (a deleted item would leave a seam), and its own completion shape: one reasoning
+# block, opened in the prompt and closed once.
+SETTINGS[QWEN] = dict(SETTINGS["gemma-4-31b"], numbered=True,
+                      form=re.compile(r"(?m)^[ \t]+\d+[.)]\s|(?i:^[\s*•-]*(system|developer|user|assistant)\s*:)|`|#|[À-ÿ]"),
+                      one_message=re.compile(r"(?:(?!<think>|</think>|<tool_call>).)*</think>(?:(?!<think>|</think>|<tool_call>).)*$", re.S))
+NUMBERED = re.compile(r"(?m)^(\d+)[.)]\s")
+
+
+def numbering_intact(text):
+    """Top-level numbered items run 1, 2, 3, ... with no gap, so no deleted item shows."""
+    numbers = [int(n) for n in NUMBERED.findall(text)]
+    return numbers == list(range(1, len(numbers) + 1))
 
 
 def sentences(text):
@@ -313,7 +332,8 @@ def checks(raw, item, e, model):
         "max_length_200": len(t.split()) <= 200,
         "own_words": own_words(t, item) >= settings["own_words"],
         "template_share_35": template_share(t, item) <= 0.35,
-        "clean_form": (t if model == "gpt-oss-20b" else t.lstrip(" *•-"))[:1].isupper() and not settings["form"].search(t) and not SOURCE.search(t)
+        "clean_form": (t.lstrip(" *•-") if settings["strip_bullets"] else t)[:1].isupper() and not settings["form"].search(t) and not SOURCE.search(t)
+                      and (not settings["numbered"] or numbering_intact(t))
                       and all(p.count('"') % 2 == 0 and p.count("“") == p.count("”") for p in t.split("\n"))
                       and all(x == REQUEST for x in REQUEST_LIKE.findall(t)),
         "no_back_reference": e is not None and not e["back_reference"],
@@ -337,7 +357,7 @@ def rung(c, e, model):
 
 # Plain side: an open model writes one plain unit per styled unit, check_pair gates it, and both models audit it
 # (make_plain.py). Nobody reads a plain version before it is used, so every check fails hard.
-PLAIN_RATIO = {"gpt-oss-20b": (1.0, 1.45), "gemma-4-31b": (1.0, 2.0)}  # plain words / styled words; Gemma's lists need more
+PLAIN_RATIO = {"gpt-oss-20b": (1.0, 1.45), "gemma-4-31b": (1.0, 2.0), QWEN: (1.0, 2.0)}  # plain words / styled words; lists need more
 MARKERS = re.compile(r"(?i)\b(we|we're|we'll|we've|us|our|let's|let’s|me|my)\b|(?-i:\bI\b(?!\.e\.))|\bthe user\b|\bcompl(y|ies|ied|iance)\b|\bdisallowed\b"
                      r"|\bfinal answer\b|(^|[.!?]\s+)(?-i:(?=[A-Z]))(So|Thus|Hence|OK|Okay|Alright|Hmm|Wait|Actually|Maybe|Probably|Must|Need)\b")
 NEGATION = re.compile(r"(?i)\b(not|no|never|none|nothing|nobody|neither|nor|without|cannot|unable|disallow\w*|forbid\w*"
@@ -474,10 +494,28 @@ def fillers(text):
     return {f: t.count(f) for f in FILLERS}
 
 
+BARE_NUMBER = re.compile(r"\s*\d+[.)]\s*")
+
+
+def plain_split(text):
+    """units() for the plain side, with a bare list number joined to the unit after it, as "1)" items already are. The
+    sentence split cuts "1. **Label:**" after "1.", and a plain unit drops list markers, so a number alone has nothing
+    to restate (Qwen's numbered outlines; gpt-oss's and Gemma's passages have no numbered lines). Returns (units, separators)."""
+    us, seps = units(text)
+    out, gaps = us[:1], []
+    for u, sep in zip(us[1:], seps):
+        if BARE_NUMBER.fullmatch(out[-1]):
+            out[-1] += sep + u
+        else:
+            out.append(u)
+            gaps.append(sep)
+    return out, gaps
+
+
 def check_pair(styled, plain_units, item, model):
     """Hard failures and flags for one candidate, one plain unit per styled unit. Labels never hold model text."""
     ratio, source = PLAIN_RATIO[model], SETTINGS["gemma-4-31b"]["source"]  # Gemma's source phrases, for both writers
-    s_units = [typography(u) for u in units(styled)[0]]
+    s_units = [typography(u) for u in plain_split(styled)[0]]
     if len(plain_units) != len(s_units):
         return ["unit count"], []
     fails, flags = [], []
@@ -525,6 +563,6 @@ def check_pair(styled, plain_units, item, model):
 
 def join(plain_units, styled):
     """The plain passage, with the styled passage's separators, so line breaks match."""
-    _, seps = units(styled)
+    _, seps = plain_split(styled)
     seps = [re.sub(r"[ \t]+", "", sep) if "\n" in sep else " " for sep in seps]  # line breaks without list indentation
     return "".join(u + (seps[i] if i < len(seps) else "") for i, u in enumerate(plain_units))

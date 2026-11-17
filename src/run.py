@@ -86,7 +86,7 @@ def main():
 
     rows = []
     for (cell, item), prompt, raw in zip(jobs, prompts, generate(args.model, tok, prompts)):
-        answer = parse_answer(raw, args.model)
+        answer = parse_answer(raw, args.model, after_thought=cell.startswith("real"))
         rows.append({
             **item,
             "cell": cell,

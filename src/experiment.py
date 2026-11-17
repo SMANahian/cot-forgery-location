@@ -25,7 +25,19 @@ MODELS = {
         "sampling": {"temperature": 1.0, "top_p": 0.95, "top_k": 64},
         "llm": {"limit_mm_per_prompt": {"image": 0}},
     },
+    # The official FP8 release (about 35 GB), so one card runs every step. Its template opens the reasoning block
+    # inside the prompt ("<think>\n"), so a finished block only needs closing. Text only, and no prefix caching:
+    # vLLM 0.33.0 can resume a hybrid (DeltaNet) model's prefix-cache hit from the wrong state on Hopper.
+    "qwen3.6-35b-a3b": {
+        "hf": "Qwen/Qwen3.6-35B-A3B-FP8",
+        "revision": "c653bba46dfa06e9658dcc0b0dc87fe4685f14a2",
+        "template": {"enable_thinking": True},
+        "thought": "{text}\n</think>\n\n",
+        "sampling": {"temperature": 1.0, "top_p": 0.95, "top_k": 20, "min_p": 0.0, "presence_penalty": 1.5},
+        "llm": {"language_model_only": True, "enable_prefix_caching": False},
+    },
 }
+QWEN = "qwen3.6-35b-a3b"
 DATASETS = ["paper_style", "authentic", "authentic_rep"]
 
 # Cell names are where/style: the forged text sits in the user message or in the model's real
@@ -48,7 +60,7 @@ def code_pattern(task):
 
 def load_forgeries(dataset, model):
     """One pair of passages per condition: the same argument, styled and plain. `paper_style` is
-    shared by both models; `authentic` and `authentic_rep` are each model's own reasoning."""
+    shared by every model; `authentic` and `authentic_rep` are each model's own reasoning."""
     name = f"{dataset}.json" if dataset == "paper_style" else f"{model}/{dataset}.json"
     rows = json.loads((ROOT / "data/forgeries" / name).read_text())
     assert [row["slot"] for row in rows] == list(range(50)), f"{name} needs one row per condition"
@@ -111,17 +123,26 @@ def build_prompt(tok, model, item, cell, task, forgeries):
 
 
 def parse_reasoning(raw, model):
-    """The first reasoning block in a raw completion."""
+    """The first reasoning block in a raw completion. Qwen's block opens in the prompt."""
     if model == "gpt-oss-20b":
         return raw.partition("<|channel|>analysis<|message|>")[2].split("<|")[0].strip()
+    if model == QWEN:
+        return raw.partition("</think>")[0].split("<|im_end|>")[0].strip()
     return raw.partition("<|channel>thought")[2].split("<channel|>")[0].strip()
 
 
-def parse_answer(raw, model):
-    """The final answer in a raw completion, or None if the model never reached one."""
+def parse_answer(raw, model, after_thought=False):
+    """The final answer in a raw completion, or None if the model never reached one. after_thought: the prompt
+    ended in a finished reasoning block (a real cell). Only Qwen needs it: its block opens in the prompt, so its
+    own completions close it, except after a forged block that the prompt already closed."""
     if model == "gpt-oss-20b":
         _, marker, answer = raw.partition("<|channel|>final<|message|>")
         return answer.split("<|")[0].strip() if marker else None
+    if model == QWEN:
+        _, marker, answer = raw.rpartition("</think>")
+        if (not marker and not after_thought) or "<think>" in answer or "<tool_call>" in answer:
+            return None  # unfinished reasoning, a reopened block or a tool call
+        return re.split(r"<\|im_end\|>|<\|endoftext\|>", answer)[0].strip()
     # Gemma answers after its last finished thought block. An unfinished thought or a tool call means
     # no answer, as a gpt-oss tool call has no final channel.
     answer = raw.rpartition("<channel|>")[2]

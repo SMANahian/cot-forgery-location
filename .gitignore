@@ -7,7 +7,7 @@ results/*/authentic_seed*.json
 results/*/authentic_design.json
 results/*/plain_design.json
 results/*/plain_picks.json
-results/*/plain_calibration.json
+results/*/plain_calibration*.json
 
 # Pipeline logs, kept locally
 results/pod_logs/
